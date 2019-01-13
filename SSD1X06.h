@@ -1,6 +1,7 @@
 /*  TWI (I2C) code to drive 128x64 monochrome oled display modules
- *  ceptimus.  September 2016
- */
+    ceptimus.  September 2016
+    Edited by Benik3 January 2019
+*/
 #ifndef SSD1X06_h
 #define SSD1X06_h
 
@@ -12,10 +13,12 @@
 
 #define SSD1X06_I2C_ADDRESS 0x3C // some modules can be 0x3D - depends on how module's internal SA0 has been wired
 
+#define I2CSPEED 800000L    //normally display communicate on 400kHz. From testing it can handle faster clock up to 800kHz. In case of problems try 400000L
 
 // pixels
 #define SSD1X06_LCDWIDTH  128
 #define SSD1X06_LCDHEIGHT  64
+#define SSD1X06_COLUMNOFFSET 0
 
 // display chars assuming 6x8 font
 #define SSD1X06_CHARWIDTH (SSD1X06_LCDWIDTH / 6)
@@ -68,9 +71,10 @@ class SSD1X06 {
     static void displayString6x8(uint8_t row, uint8_t x, const char *s, uint8_t rvsField); // if rvsField != 0 display characters in string with reversed field
     static void displayString6x8(uint8_t row, uint8_t x, const __FlashStringHelper *s, uint8_t rvsField); // same as above for constant (FLASH memory) stored strings
     static void displayByte(uint8_t row, uint8_t x, uint8_t b); // display one vertical bar of 8 pixels - bit 0 at top, bit 7 at bottom
+    static void drawLine(uint8_t row, uint8_t x, uint8_t nrow, uint8_t *b); // draw line from array of bytes
   private:
     static void displayChar6x8(uint8_t row, uint8_t x, uint8_t c);
+    static void SetColmnPage(uint8_t row, uint8_t x);
 };
 
 #endif
-

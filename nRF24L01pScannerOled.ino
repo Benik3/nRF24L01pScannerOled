@@ -1,7 +1,7 @@
 // Rough and ready 2.4 GHz band scanner using nRF24L01+ module with 128x64 graphic OLED display
 //
 // ceptimus.  November 2016.
-// Edited by Benik3 Febuary 2018 - added range select and dynamic displaying
+// Edited by Benik3 January 2019 - added range select, dynamic displaying and async scanning with timer
 
 #include "SSD1X06.h"
 
@@ -18,8 +18,8 @@
    8 IRQ ---- not connected
 */
 
-#define SSD1306
 #define rstPin 4  //OLED reset pin
+//I2C is "overclocked" to get faster refresh rates. See define in SSD1X06.h
 
 // the nRF24L01+ can tune to 128 channels with 1 MHz spacing from 2.400 GHz to 2.527 GHz.
 #define CHANNELS 128
@@ -113,23 +113,26 @@ enum TXRX_State {
   RX_EN,
 };
 
-uint16_t signalStrength[128]; // smooths signal strength with numerical range 0 - 0x7FFF
-char stringDisp[20];          //helper variable for handling start and end freqency
+uint8_t MHz = STARTCHANNEL;
+uint16_t signalStrength[128];   // smooths signal strength with numerical range 0 - 0x7FFF
+uint8_t prevStrength[128];      // save signal strength displayed on OLED for comparison with actual value
 uint8_t column = STARTCHANNEL;
+uint16_t strength;
+uint8_t row = 0;
+uint8_t b = 0;
+const uint8_t ff[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 void setup() {
   pinMode(rstPin, OUTPUT);  // Set RST pin as OUTPUT
-  digitalWrite(rstPin, HIGH); // Initially set RST HIGH
-  delay(5); // VDD (3.3V) goes high at start, lets just chill for 5 ms
   digitalWrite(rstPin, LOW);  // Bring RST low, reset the display
   delay(10);  // wait 10ms
   digitalWrite(rstPin, HIGH); // Set RST HIGH, bring out of reset
   SSD1X06::start();
   delay(300);
   SSD1X06::fillDisplay(' ');
-  SSD1X06::displayString6x8(1, 0, F("2.4GHz band scanner 3"), 0);
+  SSD1X06::displayString6x8(1, 0, F("2.4GHz band scanner 4"), 0);
   SSD1X06::displayString6x8(3, 0, F("By ceptimus. Nov '16"), 0);
-  SSD1X06::displayString6x8(5, 0, F("Mod by Benik3 Feb '18"), 0);
+  SSD1X06::displayString6x8(5, 0, F("Mod by Benik3 Jan '19"), 0);
   // prepare 'bit banging' SPI interface
   pinMode(MOSI_pin, OUTPUT);
   pinMode(SCK_pin, OUTPUT);
@@ -152,10 +155,9 @@ void setup() {
   NRF24L01_Reset();
   delay(150);
 
-  NRF24L01_WriteReg(NRF24L01_01_EN_AA, 0x00); // switch off Shockburst mode
-  NRF24L01_WriteReg(NRF24L01_06_RF_SETUP, 0x0F); // write default value to setup register
-  NRF24L01_SetTxRxMode(RX_EN); // switch to receive mode
-  Serial.begin(115200); // debugging without lcd display
+  NRF24L01_WriteReg(NRF24L01_01_EN_AA, 0x00);     // switch off Shockburst mode
+  NRF24L01_WriteReg(NRF24L01_06_RF_SETUP, 0x0F);  // write default value to setup register
+  NRF24L01_SetTxRxMode(RX_EN);                    // switch to receive mode
 
   delay(3000); // start up message
 
@@ -176,72 +178,81 @@ void setup() {
   SSD1X06::displayString6x8(1, 0, F("                     "), 0); //clear lines with texts so there can't be any orphans on display
   SSD1X06::displayString6x8(3, 0, F("                     "), 0);
   SSD1X06::displayString6x8(5, 0, F("                     "), 0);
+
+  //setup Timer1 for NRF scanning
+  cli();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+  OCR1A = 45;                           // cca 6kHz
+  TCCR1B |= (1 << WGM12);               // turn on CTC mode
+  TCCR1B |= (1 << CS11) | (1 << CS10);  // Set 64 prescaler
+  TIMSK1 |= (1 << OCIE1A);              // enable timer compare interrupt
+
+  NRF24L01_WriteReg(NRF24L01_05_RF_CH, MHz);
+  CE_on;        // start receiving
+  sei();        // allow interrupts
 }
 
-uint8_t refresh;
-int strength;
-uint8_t row = 0;
-uint8_t b = 0;
-uint16_t looptime;
-char strloop[6];
-uint16_t micro;
-uint8_t prevstrength[128];
+ISR(TIMER1_COMPA_vect) {                                        //Timer2 intterupt vector, time to get data from nrf
+  CE_off;                                                       // stop receiving - one bit is now set if received power was > -64 dBm at that instant
+  if (NRF24L01_ReadReg(NRF24L01_09_CD)) {                       // signal detected so increase signalStrength unless already maxed out
+    signalStrength[MHz] += (0x7FFF - signalStrength[MHz]) >> 5; // increase rapidly when previous value was low, with increase reducing exponentially as value approaches maximum
+  } else {                                                      // no signal detected so reduce signalStrength unless already at minimum
+    signalStrength[MHz] -= signalStrength[MHz] >> 5;            // decrease rapidly when previous value was high, with decrease reducing exponentially as value approaches zero
+  }
 
-//displaybyte 770us/0xff
-//display string 940us/char
-//loop 350us/channel
+  MHz++;
+  if (MHz == CHANNELS + STARTCHANNEL) MHz = STARTCHANNEL;
+
+  NRF24L01_WriteReg(NRF24L01_05_RF_CH, MHz);                    // Set new freqency for scan
+  CE_on;                                                        // start receiving
+  TCNT1  = 0;                                                   // clear timer counter
+  OCR1A = random(35, 55);                                       // make the measuring slightly random in time
+}
 
 void loop() {
   if (CHANNELS + STARTCHANNEL > 128) {  //check if user didn't put wrong values for channel settings
     SSD1X06::displayString6x8(1, 2, F("Wrong channel config!"), 0);
   }
   else {
-    for (uint8_t MHz = STARTCHANNEL; MHz < CHANNELS + STARTCHANNEL; MHz++ ) { // tune to frequency (2400 + MHz + starting channel) so this loop covers up to 2.400 - 2.527 GHz (maximum range module can handle) when channels is set to 128.
-      NRF24L01_WriteReg(NRF24L01_05_RF_CH, MHz);
-      CE_on; // start receiving
-
-      if (row == 0) {
-        strength = (signalStrength[column] + 0x0040) >> 7;
-        if (strength > 48) {
-          strength = 48; // limit to maximum height that fits display - 6 rows 8 bits
-        }
-      }
-
-      if (strength != prevstrength[column]) { //refresh only when data change
-        b = 0x00;
-        if (strength > (6 - row) << 3) { // all 8 pixels on this row of display to be set
-          b = 0xFF;
-        } else if (strength > (5 - row) << 3) { // some pixels on this row to be set
-          b = 0xFF << (((6 - row) << 3) - strength);
-        }
-        SSD1X06::displayByte(row, column, b);
-        row++;
-        if (row == 6) {
-          row = 0;
-          column++;
-          if (column == CHANNELS + STARTCHANNEL) column = STARTCHANNEL;
-        }
-      }
-      else {
-        column++;
-        if (column == CHANNELS + STARTCHANNEL) column = STARTCHANNEL;
-        row = 0;
-        delayMicroseconds(random(130, 230)); // allow receiver time to tune and start receiving 130 uS seems to be the minimum time.  Random additional delay helps prevent strobing effects with frequency-hopping transmitters.
-      }
-      prevstrength[column - 1] = strength;
-
-      CE_off; // stop receiving - one bit is now set if received power was > -64 dBm at that instant
-      if (NRF24L01_ReadReg(NRF24L01_09_CD)) { // signal detected so increase signalStrength unless already maxed out
-        signalStrength[MHz] += (0x7FFF - signalStrength[MHz]) >> 5; // increase rapidly when previous value was low, with increase reducing exponentially as value approaches maximum
-      } else { // no signal detected so reduce signalStrength unless already at minimum
-        signalStrength[MHz] -= signalStrength[MHz] >> 5; // decrease rapidly when previous value was high, with decrease reducing exponentially as value approaches zero
-      }
-      Serial.print((signalStrength[MHz] + 0x0100) >> 9, HEX); // debugging without lcd display
-      Serial.print(" "); // debugging without lcd display
+    strength = (signalStrength[column] + 0x0040) >> 7;
+    if (strength > 48) {
+      strength = 48; // limit to maximum height that fits display - 6 rows 8 bits
     }
-    Serial.print("\n"); // debugging without lcd display
+
+    uint8_t arr[6] = {0};
+
+    if (strength > prevStrength[column]) {
+      uint8_t val = strength - ((prevStrength[column] / 8) * 8); //only the value to change
+      row = 6 - (strength / 8);                                  //starting row, lower rows are 0 and unchanged
+      if (strength % 8) row--;
+      uint8_t nrow = ((val - 1) / 8);                            // Number of aditional rows to change
+
+      memcpy(arr, ff, nrow + 1);                                // set bytes of array to 0xff
+      if (val % 8) {                                            // The first row which may not contain full 8 pixels
+        arr[0] = 0xFF << (8 - (val % 8));
+      }
+
+      SSD1X06::drawLine(row, column, nrow, arr);
+      prevStrength[column] = strength;
+    }
+
+    else if (strength < prevStrength[column]) {
+      row = 6 - (prevStrength[column] / 8);
+      if (prevStrength[column] % 8) row--;
+      uint8_t nrow = 5 - (strength / 8) - row;
+
+      arr[nrow] = 0xFF << (8 - (strength % 8));
+      SSD1X06::drawLine(row, column, nrow, arr);
+      prevStrength[column] = strength;
+    }
+
+    column++;
+    if (column == CHANNELS + STARTCHANNEL) column = STARTCHANNEL;
   }
 }
+
 uint8_t _spi_write(uint8_t command)
 {
   uint8_t result = 0;
